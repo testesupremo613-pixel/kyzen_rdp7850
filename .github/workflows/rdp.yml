@@ -1,0 +1,150 @@
+name: RDP
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Configure Core RDP
+        shell: powershell
+        run: |
+          Write-Host "Configuring RDP..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP configured"
+
+      - name: Create RDP User
+        shell: powershell
+        run: |
+          Write-Host "Creating RDP user..."
+          $username = "kyzexel"
+          $password = "rdp@123"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
+              Write-Host "User $username created"
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+          Write-Host "User $username added to groups"
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          Write-Host "Installing Tailscale..."
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          Write-Host "Tailscale installed"
+
+      - name: Establish Tailscale Connection
+        shell: powershell
+        run: |
+          Write-Host "Connecting Tailscale..."
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="gh-rdp-$env:GITHUB_RUN_ID"
+          $tsIP = $null
+          for ($i = 0; $i -lt 30 -and -not $tsIP; $i++) {
+              $candidate = (& $ts ip -4 2>$null | Select-Object -First 1).Trim()
+              if ($candidate -match '^100\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
+                  $tsIP = $candidate
+                  break
+              }
+              Write-Host "Waiting for Tailscale IP... ($i/30)"
+              Start-Sleep -Seconds 2
+          }
+          if (-not $tsIP) {
+              Write-Host "Retrying Tailscale IP..."
+              for ($j = 0; $j -lt 20 -and -not $tsIP; $j++) {
+                  $candidate = (& $ts ip -4 2>$null | Select-Object -First 1).Trim()
+                  if ($candidate -match '^100\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
+                      $tsIP = $candidate
+                      break
+                  }
+                  Start-Sleep -Seconds 3
+              }
+          }
+          if (-not $tsIP) {
+              Write-Host "Failed to obtain Tailscale IPv4 address"
+              throw "Unable to obtain Tailscale IPv4 address."
+          }
+          Write-Host "Tailscale connected with IP: $tsIP"
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Wait for RDP
+        shell: powershell
+        run: |
+          Write-Host "Waiting for RDP to be ready..."
+          $ready = $false
+          for ($i = 0; $i -lt 30; $i++) {
+              $result = Test-NetConnection -ComputerName "127.0.0.1" -Port 3389 -WarningAction SilentlyContinue
+              if ($result.TcpTestSucceeded) {
+                  $ready = $true
+                  break
+              }
+              Write-Host "RDP not ready... ($i/30)"
+              Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 3
+          }
+          if (-not $ready) {
+              Write-Host "RDP port 3389 not ready"
+              throw "RDP port 3389 is not ready."
+          }
+          Write-Host "RDP is ready"
+
+      - name: Publish RDP Status
+        shell: powershell
+        run: |
+          Write-Host "Publishing RDP status..."
+          $ip = "$env:TAILSCALE_IP"
+          $status = @{
+            port = 3389
+            status = "ready"
+            ip = "$ip"
+            username = "kyzexel"
+            updated = (Get-Date).ToUniversalTime().ToString("o")
+          } | ConvertTo-Json -Compress
+          Set-Content -Path ".rdp_status.json" -Value $status -Encoding utf8
+          Write-Host "RDP status file created with IP: $ip"
+          Write-Host "Status content: $status"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .rdp_status.json
+          git commit -m "Publish RDP status - $ip" --allow-empty
+          git push
+          Write-Host "RDP status published to repository"
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "RDP ACCESS INFO"
+          Write-Host "=========================================="
+          Write-Host "Address: $ip`:3389"
+          Write-Host "Username: kyzexel"
+          Write-Host "Password: rdp@123"
+          Write-Host "=========================================="
+          Write-Host ""
+
+      - name: Maintain RDP
+        shell: powershell
+        run: |
+          Write-Host "Maintaining RDP session..."
+          while ($true) {
+              Write-Host "RDP active - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+              Start-Sleep -Seconds 300
+          }
